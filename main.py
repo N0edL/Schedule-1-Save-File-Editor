@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QUrl, QObject, Signal, QThread
 from PySide6.QtGui import QRegularExpressionValidator, QIntValidator, QPalette, QColor, QDesktopServices, QIcon
 
-CURRENT_VERSION = "1.0.5"
+CURRENT_VERSION = "1.0.6"
 
 class UpdateChecker(QObject):
     finished = Signal(tuple) 
