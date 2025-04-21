@@ -1,0 +1,20 @@
+# Python virtual environment
+.venv/
+
+# Build artifacts
+dist/
+build/
+output/
+
+# Python cache
+__pycache__/
+
+# files
+pass
+
+# Spec files
+*.spec
+
+# txt files
+version_info.txt
+*.log
