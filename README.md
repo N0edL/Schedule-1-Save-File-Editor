@@ -147,8 +147,8 @@ Security solutions may flag the editor due to:
 ### Installation
 ```bash
 # Clone repository
-git clone https://github.com/N0edL/Schedule-1-Save-Editor.git
-cd Schedule-1-Save-Editor
+git clone https://github.com/N0edL/Schedule-1-Save-File-Editor.git
+cd Schedule-1-Save-File-Editor
 
 # Install dependencies
 pip install -r requirements.txt
