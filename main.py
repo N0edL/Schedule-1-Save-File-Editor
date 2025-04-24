@@ -1,6 +1,6 @@
 # pyinstaller --noconfirm schedule1_editor.spec
 
-import sys, json, os, random, string, shutil, tempfile, urllib.request, zipfile, winreg, re, subprocess, psutil
+import sys, json, os, random, string, shutil, tempfile, urllib.request, zipfile, winreg, re, subprocess, psutil, ctypes, atexit, threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -8,12 +8,13 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QWidget,
     QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QLabel, QFormLayout, QLineEdit, QComboBox, QPushButton,
-    QMessageBox, QTabWidget, QCheckBox, QGroupBox, QTextEdit, QHeaderView, QDialog, QProgressDialog
+    QMessageBox, QTabWidget, QCheckBox, QGroupBox, QTextEdit, QHeaderView, QDialog, QProgressDialog, QListWidget, QDialogButtonBox, QFileDialog
 )
-from PySide6.QtCore import Qt, QUrl, QObject, Signal, QThread
+from PySide6.QtCore import Qt, QUrl, QObject, Signal, QThread, QFile, QIODevice
 from PySide6.QtGui import QRegularExpressionValidator, QIntValidator, QPalette, QColor, QDesktopServices, QIcon
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
-CURRENT_VERSION = "1.0.6"
+CURRENT_VERSION = "1.0.7"
 
 class UpdateChecker(QObject):
     finished = Signal(tuple) 
@@ -22,7 +23,7 @@ class UpdateChecker(QObject):
         try:
             url = "https://api.github.com/repos/N0edL/Schedule-1-Save-File-Editor/releases/latest"
             req = urllib.request.Request(url)
-            req.add_header('User-Agent', 'Schedule-1-Save-Editor')
+            req.add_header('User-Agent', 'Schedule-1-Save-File-Editor')
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode())
                 latest_version = data.get('tag_name', '')
@@ -65,6 +66,73 @@ def find_game_directory():
             return game_dir
     return None
 
+def is_admin():
+    """Check if the script is running with administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def run_as_admin():
+    """Relaunch the executable with administrator privileges."""
+    if not getattr(sys, 'frozen', False):
+        # If running as a script (not an executable), use sys.executable with elevated privileges
+        script_path = os.path.abspath(__file__)
+        try:
+            ctypes.windll.shell32.ShellExecuteW(
+                None,           # hwnd
+                "runas",        # Verb to request elevation
+                sys.executable, # Path to Python interpreter
+                f'"{script_path}"',  # Arguments (script path quoted)
+                None,           # Working directory (default to current)
+                1               # SW_SHOWNORMAL (show window normally)
+            )
+        except Exception as e:
+            print(f"Failed to relaunch as admin: {e}")
+            sys.exit(1)
+    else:
+        # If running as a PyInstaller executable
+        exe_path = sys.executable
+        try:
+            ctypes.windll.shell32.ShellExecuteW(
+                None,           # hwnd
+                "runas",        # Verb to request elevation
+                exe_path,       # Path to the executable
+                "",             # No additional arguments needed
+                None,           # Working directory (default to current)
+                1               # SW_SHOWNORMAL (show window normally)
+            )
+        except Exception as e:
+            print(f"Failed to relaunch as admin: {e}")
+            sys.exit(1)
+    sys.exit(0)  # Exit the current instance after launching the elevated one
+
+def get_config_path():
+    """Return the path to the config file."""
+    config_dir = Path.home() / "AppData" / "Local" / "noedl.xyz" / "Schedule1Editor"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "config.json"
+
+def load_config():
+    """Load the configuration from the config file."""
+    config_path = get_config_path()
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+def save_config(config):
+    """Save the configuration to the config file."""
+    config_path = get_config_path()
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+    except IOError as e:
+        print(f"Failed to save config: {e}")
+
 def is_game_running():
     """Check if the game is running."""
     try:
@@ -90,7 +158,10 @@ def parse_npc_log(log_text: str) -> list[tuple[str, str]]:
     return [(name.strip(), id.strip()) for name, id in matches]
 
 GOOFYAHHHNAMES = [
-    "NoedLxCry4pt", "Cry4pt", "NoedL",
+    "NoedLxCry4pt", "Nigger", "Fuck You", "Cry4pt", "NoedL", "I Love Kids", "I Love Children",
+    "Bitch", "Fuck", "Retard", "Anal Destroyer", "Nigga", "Cum Shot", "Ass Blaster", "Cummy Wummy", 
+    "Deez Nutz", "Supreme", "Big Chungus", "Shit", "Hell", "Ass", "Bastard", "Cunt", "Dick", 
+    "Pussy", "Faggot", "Mother Fucker", "Son Of A Bitch", "Nazi", "Sex Offender", "KYS",
     # Added drug and medicine names
     "Abacavir", "Acetaminophen", "Acetazolamide", "Aciclovir", "Adalimumab", "Adenosine", "Adrenaline", 
     "Albendazole", "Albuterol", "Allopurinol", "Amlodipine", "Amoxicillin", "Amphotericin B", "Aspirin", 
@@ -130,17 +201,75 @@ class SaveManager:
         return re.fullmatch(r'[0-9]{17}', name) is not None
 
     def _find_save_directory(self) -> Optional[Path]:
-        base_path = Path.home() / "AppData" / "LocalLow" / "TVGS" / "Schedule I" / "saves"
-        if not base_path.exists():
+        """Attempt to find the save directory, using saved config, default, or user input."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        # Default save path
+        default_path = Path.home() / "AppData" / "LocalLow" / "TVGS" / "Schedule I" / "saves"
+
+        def validate_save_path(path: Path) -> Optional[Path]:
+            """Validate if the path contains a SteamID folder and SaveGame_ subfolder."""
+            if not path.exists():
+                return None
+            steamid_folders = [f for f in path.iterdir() if f.is_dir() and self._is_steamid_folder(f.name)]
+            if not steamid_folders:
+                return None
+            self.steamid_folder = steamid_folders[0]  # Set the first SteamID folder
+            for item in self.steamid_folder.iterdir():
+                if item.is_dir() and item.name.startswith("SaveGame_"):
+                    return item
             return None
-        steamid_folders = [f for f in base_path.iterdir() if f.is_dir() and self._is_steamid_folder(f.name)]
-        if not steamid_folders:
-            return None
-        self.steamid_folder = steamid_folders[0]
-        for item in self.steamid_folder.iterdir():
-            if item.is_dir() and item.name.startswith("SaveGame_"):
-                return item
-        return None
+
+        # Load saved custom path from config
+        config = load_config()
+        saved_path_str = config.get("custom_save_directory")
+        if saved_path_str:
+            saved_path = Path(saved_path_str)
+            result = validate_save_path(saved_path)
+            if result:
+                return result
+
+        # Try the default path if no valid saved path
+        result = validate_save_path(default_path)
+        if result:
+            return result
+
+        # If both saved and default fail, prompt user for a custom directory
+        while True:
+            selected_dir = QFileDialog.getExistingDirectory(
+                None,
+                "Default save directory not found. Please select your Schedule I saves folder.",
+                str(Path.home()),
+                QFileDialog.ShowDirsOnly
+            )
+
+            if not selected_dir:
+                reply = QMessageBox.question(
+                    None,
+                    "No Directory Selected",
+                    "No save directory was selected. Would you like to exit?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    sys.exit(0)
+                else:
+                    continue
+
+            custom_path = Path(selected_dir)
+            result = validate_save_path(custom_path)
+            if result:
+                # Save the custom directory to config
+                config["custom_save_directory"] = str(custom_path)
+                save_config(config)
+                return result
+            else:
+                QMessageBox.warning(
+                    None,
+                    "Invalid Directory",
+                    "The selected directory does not contain valid Schedule I save data.\n"
+                    "Please select a folder containing a 17-digit SteamID subfolder with 'SaveGame_' directories."
+                )
 
     def get_save_organisation_name(self, save_path: Path) -> str:
         try:
@@ -293,9 +422,9 @@ class SaveManager:
             "networth": int(money_data.get("Networth", 0)),
             "lifetime_earnings": int(money_data.get("LifetimeEarnings", 0)),
             "weekly_deposit_sum": int(money_data.get("WeeklyDepositSum", 0)),
+            "current_rank": rank_data.get("CurrentRank", "Unknown"),
             "rank_number": int(rank_data.get("Rank", 0)),
             "tier": int(rank_data.get("Tier", 0)),
-            "total_xp": int(rank_data.get("TotalXP", 0)),
             "cash_balance": cash_balance  # Ensure cash balance is an integer
         }
 
@@ -324,6 +453,11 @@ class SaveManager:
             self.save_data["money"]["WeeklyDepositSum"] = new_sum
             self._save_json_file("Money.json", self.save_data["money"])
 
+    def set_rank(self, new_rank: str):
+        if "rank" in self.save_data:
+            self.save_data["rank"]["CurrentRank"] = new_rank
+            self._save_json_file("Rank.json", self.save_data["rank"])
+
     def set_rank_number(self, new_rank: int):
         if "rank" in self.save_data:
             self.save_data["rank"]["Rank"] = new_rank
@@ -332,11 +466,6 @@ class SaveManager:
     def set_tier(self, new_tier: int):
         if "rank" in self.save_data:
             self.save_data["rank"]["Tier"] = new_tier
-            self._save_json_file("Rank.json", self.save_data["rank"])
-
-    def set_total_xp(self, new_xp: int):
-        if "rank" in self.save_data:
-            self.save_data["rank"]["TotalXP"] = new_xp
             self._save_json_file("Rank.json", self.save_data["rank"])
 
     def set_organisation_name(self, new_name: str):
@@ -356,7 +485,7 @@ class SaveManager:
             data = {
                 "DataType": "ProductManagerData",
                 "DataVersion": 0,
-                "GameVersion": "0.3.3f14",
+                "GameVersion": "0.3.3f15",
                 "DiscoveredProducts": [],
                 "ListedProducts": [],
                 "ActiveMixOperation": {"ProductID": "", "IngredientID": ""},
@@ -375,12 +504,19 @@ class SaveManager:
 
     def generate_products(self, count: int, id_length: int, price: int, 
                         add_to_listed: bool = False, add_to_favourited: bool = False,
-                        min_properties: int = 1, max_properties: int = 34, 
+                        selected_properties: list = None, selected_ingredients: list = None,
+                        min_props: int = 0, max_props: int = None, 
+                        min_ingredients: int = 0, max_ingredients: int = None,
                         drug_type: int = 0, use_id_as_name: bool = False):
         products_path = self.current_save / "Products"
         os.makedirs(products_path, exist_ok=True)
         created_path = products_path / "CreatedProducts"
         os.makedirs(created_path, exist_ok=True)
+
+        selected_properties = selected_properties or []
+        selected_ingredients = selected_ingredients or []
+        max_props = max_props if max_props is not None else len(selected_properties)
+        max_ingredients = max_ingredients if max_ingredients is not None else len(selected_ingredients)
 
         products_rel_path = "Products/Products.json"
         products_json = self.current_save / products_rel_path
@@ -392,7 +528,7 @@ class SaveManager:
             data = {
                 "DataType": "ProductManagerData",
                 "DataVersion": 0,
-                "GameVersion": "0.3.3f14",
+                "GameVersion": "0.3.3f15",
                 "DiscoveredProducts": [],
                 "ListedProducts": [],
                 "ActiveMixOperation": {"ProductID": "", "IngredientID": ""},
@@ -409,14 +545,6 @@ class SaveManager:
         listed_products = data.setdefault("ListedProducts", [])
         favourited_products = data.setdefault("FavouritedProducts", [])
 
-        property_pool = ["athletic", "balding", "gingeritis", "spicy", "jennerising", "thoughtprovoking",
-                        "tropicthunder", "giraffying", "longfaced", "sedating", "smelly", "paranoia", "laxative",
-                        "caloriedense", "energizing", "calming", "brighteyed", "foggy", "glowing", "antigravity",
-                        "slippery", "munchies", "explosive", "refreshing", "shrinking", "euphoric", "disorienting",
-                        "toxic", "zombifying", "cyclopean", "seizureinducing", "focused", "electrifying", "sneaky"]
-        ingredients = ["flumedicine", "gasoline", "mouthwash", "horsesemen", "iodine", "chili", "paracetamol",
-                    "energydrink", "donut", "banana", "viagra", "cuke", "motoroil", "addy", "megabean", "battery"]
-        
         existing_ids = set(discovered)
 
         def generate_id(length):
@@ -424,7 +552,6 @@ class SaveManager:
 
         for _ in range(count):
             if use_id_as_name:
-                # Generate unique product_id when using IDs as names
                 product_id = generate_id(id_length)
                 while product_id in existing_ids:
                     product_id = generate_id(id_length)
@@ -432,7 +559,6 @@ class SaveManager:
                 product_name = product_id
                 product_key = product_id
             else:
-                # Select unique product_name when using random names
                 if self.available_names:
                     product_name = self.available_names.pop(0)
                 else:
@@ -447,29 +573,31 @@ class SaveManager:
                 self.used_names.add(product_name)
                 product_key = product_name
 
-            # Add to discovered products
             discovered.append(product_key)
 
-            # Create mix recipe
-            ingredient = random.choice(ingredients)
-            mix_recipes.append({
-                "Product": ingredient,
-                "Mixer": product_key,
-                "Output": product_key
-            })
+            # Select random number of ingredients
+            num_ingredients = random.randint(min_ingredients, min(max_ingredients, len(selected_ingredients)))
+            ingredients = random.sample(selected_ingredients, k=num_ingredients) if selected_ingredients and num_ingredients > 0 else ["flumedicine"]
+            for ingredient in ingredients:
+                mix_recipes.append({
+                    "Product": ingredient,
+                    "Mixer": product_key,
+                    "Output": product_key
+                })
 
-            # Set price if specified
             if price is not None and price > 0:
                 prices.append({"String": product_key, "Int": price})
 
-            # Create product data
-            properties = random.sample(property_pool, random.randint(min_properties, max_properties))
+            # Select random number of properties
+            num_properties = random.randint(min_props, min(max_props, len(selected_properties)))
+            properties = random.sample(selected_properties, k=num_properties) if selected_properties and num_properties > 0 else []
+
             product_data = {
                 "DataType": "WeedProductData",
                 "DataVersion": 0,
-                "GameVersion": "0.3.3f14",
+                "GameVersion": "0.3.3f15",
                 "Name": product_name,
-                "ID": product_key,  # Set "ID" to product_key
+                "ID": product_key,
                 "DrugType": drug_type,
                 "Properties": properties,
                 "AppearanceSettings": {
@@ -480,11 +608,8 @@ class SaveManager:
                 }
             }
 
-            # Save individual product file
             product_rel_path = f"Products/CreatedProducts/{product_key}.json"
             self._save_json_file(product_rel_path, product_data)
-
-            # Collect new product keys
             new_product_ids.append(product_key)
 
         if add_to_listed:
@@ -686,7 +811,7 @@ class SaveManager:
             missing_template = {
                 "DataType": "PropertyData",
                 "DataVersion": 0,
-                "GameVersion": "0.3.3f14",
+                "GameVersion": "0.3.3f15",
                 "PropertyCode": "",
                 "IsOwned": True,
                 "SwitchStates": [True, True, True, True],
@@ -746,7 +871,7 @@ class SaveManager:
             missing_template = {
                 "DataType": "BusinessData",
                 "DataVersion": 0,
-                "GameVersion": "0.3.3f14",
+                "GameVersion": "0.3.3f15",
                 "PropertyCode": "",
                 "IsOwned": True,
                 "SwitchStates": [True, True, True, True],
@@ -1012,6 +1137,68 @@ class SaveManager:
                             })
         return plastic_pots
 
+class MultiSelectComboBox(QWidget):
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.items = items
+        self.selected_items = []
+        
+        # Set up the layout
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Add the "Select..." button
+        self.select_button = QPushButton("Select...")
+        self.select_button.clicked.connect(self.show_selection_dialog)
+        layout.addWidget(self.select_button)
+        
+    def show_selection_dialog(self):
+        # Create a dialog for item selection
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Items")
+        dialog_layout = QVBoxLayout()
+        
+        # Search input
+        search_input = QLineEdit()
+        search_input.setPlaceholderText("Search...")
+        dialog_layout.addWidget(search_input)
+        
+        # List widget for multi-selection
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.MultiSelection)
+        list_widget.addItems(self.items)
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item.text() in self.selected_items:
+                item.setSelected(True)
+        search_input.textChanged.connect(lambda text: self.filter_list(list_widget, text))
+        dialog_layout.addWidget(list_widget)
+        
+        # Dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+        
+        dialog.setLayout(dialog_layout)
+        dialog.resize(300, 400)
+        
+        # Update selected items if dialog is accepted
+        if dialog.exec() == QDialog.Accepted:
+            selected = [item.text() for item in list_widget.selectedItems()]
+            self.selected_items = selected
+            
+    def filter_list(self, list_widget, text):
+        # Filter the list based on search input
+        text = text.lower()
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            item.setHidden(text not in item.text().lower())
+            
+    def get_selected_items(self):
+        # Return the list of selected items
+        return self.selected_items
+
 class FeatureRevertDialog(QDialog):
     def __init__(self, parent=None, manager=None):
         super().__init__(parent)
@@ -1118,85 +1305,33 @@ class MoneyTab(QWidget):
             "weekly_deposit_sum": int(self.weekly_deposit_sum_input.text())
         }
 
-XP_PER_TIER = [
-    200, 200, 200, 200, 200,           # Street Rat I-V
-    400, 400, 400, 400, 400,         # Hoodlum I-V
-    625, 625, 625, 625, 625,         # Peddler I-V
-    825, 825, 825, 825, 825,         # Hustler I-V
-    1025, 1025, 1025, 1025, 1025,    # Bagman I-V
-    1050, 1050, 1050, 1050, 1050,    # Enforcer I-V
-    1450, 1450, 1450, 1450, 1450,    # Shot Caller I-V
-    1675, 1675, 1675, 1675, 1675,    # Block Boss I-V
-    1875, 1875, 1875, 1875, 1875,    # Underlord I-V
-    2075, 2075, 2075, 2075, 2075     # Baron I-V
-]
-
-RANK_NAMES = [
-    "Street Rat", "Hoodlum", "Peddler", "Hustler",
-    "Bagman", "Enforcer", "Shot Caller", "Block Boss",
-    "Underlord", "Baron"
-]
-
 class RankTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QFormLayout()
-
-        # Rank and Tier Inputs
         self.rank_combo = QComboBox()
-        self.tier_combo = QComboBox()
-
-        # Populate rank and tier dropdowns
-        for rank in RANK_NAMES:
-            self.rank_combo.addItem(rank)
-        for tier in range(1, 6):
-            self.tier_combo.addItem(f"Tier {tier}")
-
-        # XP Display (read-only)
-        self.xp_label = QLabel("0")
-
-        # Add widgets to the layout
-        layout.addRow("Rank:", self.rank_combo)
-        layout.addRow("Tier:", self.tier_combo)
-        layout.addRow("Total XP:", self.xp_label)
-
+        self.rank_combo.addItems(["Street", "Dealer", "Supplier", "Distributor", "Kingpin"])
+        self.rank_number_input = QLineEdit()
+        # Updated validator to allow up to 999
+        self.rank_number_input.setValidator(QIntValidator(0, 999))
+        self.tier_input = QLineEdit()
+        self.tier_input.setValidator(QIntValidator(0, 100))
+        layout.addRow("Current Rank:", self.rank_combo)
+        layout.addRow("Rank Number:", self.rank_number_input)
+        layout.addRow("Tier:", self.tier_input)
         self.setLayout(layout)
 
-        # Update XP when rank or tier changes
-        self.rank_combo.currentIndexChanged.connect(self.update_xp_display)
-        self.tier_combo.currentIndexChanged.connect(self.update_xp_display)
-
     def set_data(self, info):
-        """Set the rank and tier based on the provided info dictionary."""
-        rank = info.get("rank", 0)
-        tier = info.get("tier", 0)
-        total_xp = sum(XP_PER_TIER[rank * 5:rank * 5 + tier + 1])
-        self.rank_combo.setCurrentIndex(rank)
-        self.tier_combo.setCurrentIndex(tier)
-        self.xp_label.setText(str(total_xp))
+        self.rank_combo.setCurrentText(info.get("current_rank", "Street"))
+        self.rank_number_input.setText(str(info.get("rank_number", 0)))
+        self.tier_input.setText(str(info.get("tier", 0)))
 
     def get_data(self):
-        """Get the current rank, tier, and total XP as a dictionary."""
-        rank = self.rank_combo.currentIndex()
-        tier = self.tier_combo.currentIndex()
-        total_xp = sum(XP_PER_TIER[rank * 5:rank * 5 + tier + 1])
         return {
-            "rank_number": rank,
-            "tier": tier,
-            "total_xp": total_xp
+            "current_rank": self.rank_combo.currentText(),
+            "rank_number": int(self.rank_number_input.text()),
+            "tier": int(self.tier_input.text())
         }
-        QMessageBox.critical(self, "Error", f"Failed to update properties: {str(e)}")
-
-    def update_xp_display(self):
-        """Update the XP label based on the selected rank and tier."""
-        rank_index = self.rank_combo.currentIndex()
-        tier_index = self.tier_combo.currentIndex()
-        xp = sum(XP_PER_TIER[rank_index * 5:rank_index * 5 + tier_index + 1])
-        self.xp_label.setText(str(xp))
-
-    def get_current_rank(self):
-        """Get the current rank as a string."""
-        return self.rank_combo.currentText()
 
 class PropertiesTab(QWidget):
     def __init__(self, parent=None, main_window=None):
@@ -1254,7 +1389,7 @@ class PropertiesTab(QWidget):
         layout.addWidget(self.plastic_pots_group)
 
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(15)
+        layout.setSpacing(5)
         self.setLayout(layout)
         self.load_property_types()
 
@@ -1427,7 +1562,7 @@ class PropertiesTab(QWidget):
                 data["PlantData"] = {
                     "DataType": "PlantData",
                     "DataVersion": 0,
-                    "GameVersion": "0.3.3f14",
+                    "GameVersion": "0.3.3f15",
                     "SeedID": "",
                     "GrowthProgress": 0.0,
                     "YieldLevel": 0.0,
@@ -1483,41 +1618,51 @@ class ProductsTab(QWidget):
         self.main_window = main_window
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(15)
+        layout.setSpacing(5)
 
-        # **Discovery Section**
+        self.property_pool = [
+            "athletic", "balding", "gingeritis", "spicy", "jennerising", "thoughtprovoking",
+            "tropicthunder", "giraffying", "longfaced", "sedating", "smelly", "paranoia", "laxative",
+            "caloriedense", "energizing", "calming", "brighteyed", "foggy", "glowing", "antigravity",
+            "slippery", "munchies", "explosive", "refreshing", "shrinking", "euphoric", "disorienting",
+            "toxic", "zombifying", "cyclopean", "seizureinducing", "focused", "electrifying", "sneaky", "schizophenic"
+        ]
+        self.ingredients = [
+            "flumedicine", "gasoline", "mouthwash", "horsesemen", "iodine", "chili", "paracetamol",
+            "energydrink", "donut", "banana", "viagra", "cuke", "motoroil", "addy", "megabean", "battery"
+        ]
+        
+# Product Discovery Section
         discovery_group = QGroupBox("Product Discovery")
         discovery_layout = QVBoxLayout()
         discovery_layout.setContentsMargins(10, 10, 10, 10)
+        discovery_layout.setSpacing(5)
 
         # Instruction label
-        discovery_layout.addWidget(QLabel("Select products:"))
+        discovery_layout.addWidget(QLabel("Select Products:"))
 
         # Checkboxes for product selection
         self.discover_cocaine_checkbox = QCheckBox("Cocaine")
         self.discover_meth_checkbox = QCheckBox("Meth")
+        
         discovery_layout.addWidget(self.discover_cocaine_checkbox)
         discovery_layout.addWidget(self.discover_meth_checkbox)
+        
         discovery_layout.addSpacing(5)
-
-        # Horizontal layout for buttons
         buttons_layout = QHBoxLayout()
-
-        # Discover button
+        
         discover_button = QPushButton("Discover Selected")
         discover_button.clicked.connect(self.discover_selected_products)
+        
         buttons_layout.addWidget(discover_button)
-
-        # Undiscover button
         undiscover_button = QPushButton("Undiscover Selected")
         undiscover_button.clicked.connect(self.undiscover_selected_products)
-        buttons_layout.addWidget(undiscover_button)
 
+        buttons_layout.addWidget(undiscover_button)
         discovery_layout.addLayout(buttons_layout)
-        discovery_layout.addStretch()
         discovery_group.setLayout(discovery_layout)
 
-        # **Generation Section**
+        # **Generation Section (Unchanged)**
         generation_group = QGroupBox("Product Generation")
         form_layout = QFormLayout()
         form_layout.setVerticalSpacing(8)
@@ -1526,62 +1671,49 @@ class ProductsTab(QWidget):
 
         self.count_input = QLineEdit()
         self.count_input.setValidator(QIntValidator(1, 1000))
-
         self.id_length_input = QLineEdit()
         self.id_length_input.setValidator(QIntValidator(5, 20))
-
         self.price_input = QLineEdit()
         self.price_input.setValidator(QIntValidator(1, 1000000))
-
         form_layout.addRow("Number of Products:", self.count_input)
         form_layout.addRow("ID Length:", self.id_length_input)
         form_layout.addRow("Price:", self.price_input)
 
-        self.drug_type_input = QLineEdit()
-        self.drug_type_input.setValidator(QIntValidator(0, 2))  # Adjust range as needed
-        self.drug_type_input.setText("0")  # Default to 0
-        form_layout.addRow("Drug Type:", self.drug_type_input)
+        self.drug_type_combo = QComboBox()
+        self.drug_type_combo.addItem("Marijuana", 0)
+        self.drug_type_combo.addItem("Meth", 1)
+        self.drug_type_combo.addItem("Cocaine", 2)
+        form_layout.addRow("Drug Type:", self.drug_type_combo)
 
-        # Add after existing form elements
-        self.min_properties_input = QLineEdit()
-        self.min_properties_input.setValidator(QIntValidator(1, 34))
-        self.min_properties_input.setText("1")
-        form_layout.addRow("Min Mixes Per Product:", self.min_properties_input)
+        self.properties_widget = MultiSelectComboBox(self.property_pool)
+        form_layout.addRow("Properties:", self.properties_widget)
+        
+        self.ingredients_widget = MultiSelectComboBox(self.ingredients)
+        form_layout.addRow("Ingredients:", self.ingredients_widget)
 
-        self.max_properties_input = QLineEdit()
-        self.max_properties_input.setValidator(QIntValidator(1, 34))
-        self.max_properties_input.setText("34")
-        form_layout.addRow("Max Mixes Per Product:", self.max_properties_input)
-
-        # Add checkbox for name generation type
+        self.unique_combinations_checkbox = QCheckBox("Unique Properties and Ingredients for Each Product")
+        form_layout.addRow("", self.unique_combinations_checkbox)
         self.name_generation_checkbox = QCheckBox("Use Random Names Instead Of IDs")
         form_layout.addRow("", self.name_generation_checkbox)
-
         self.add_to_listed_checkbox = QCheckBox("Add to Listed Products")
         form_layout.addRow("", self.add_to_listed_checkbox)
-
         self.add_to_favourited_checkbox = QCheckBox("Add to Favourited Products")
         form_layout.addRow("", self.add_to_favourited_checkbox)
 
-        # **Buttons for Generation** - Moved inside the form_layout
         button_layout = QHBoxLayout()
         generate_button = QPushButton("Generate Products")
         generate_button.clicked.connect(self.generate_products)
-        button_layout.addWidget(generate_button)
-
         reset_button = QPushButton("Reset Products")
         reset_button.clicked.connect(self.delete_generated_products)
+        button_layout.addWidget(generate_button)
         button_layout.addWidget(reset_button)
-
-        # Add the button layout to the form layout (inside the group box)
         form_layout.addRow(button_layout)
 
         generation_group.setLayout(form_layout)
-
-        # Assemble main layout
+        
+        # Add groups to main layout
         layout.addWidget(discovery_group)
         layout.addWidget(generation_group)
-        layout.addStretch()  # Optional: adds stretch to main layout if needed
         self.setLayout(layout)
 
     def discover_selected_products(self):
@@ -1646,48 +1778,65 @@ class ProductsTab(QWidget):
             QMessageBox.critical(self, "Error", "Save manager not available.")
             return
         try:
-            count = int(self.count_input.text())
-            
-            # Handle ID length based on checkbox state
+            count = int(self.count_input.text()) if self.count_input.text().strip() else 1
+
             if self.name_generation_checkbox.isChecked():
-                # Using random names: ID length is optional, default to 10 if empty
                 id_length_text = self.id_length_input.text().strip()
                 id_length = int(id_length_text) if id_length_text else 10
             else:
-                # Not using random names: ID length is required
                 id_length_text = self.id_length_input.text().strip()
                 if not id_length_text:
                     raise ValueError("ID Length is required when not using random names")
                 id_length = int(id_length_text)
-            
-            # Handle price input
+
             price_text = self.price_input.text().strip()
-            price = int(price_text) if price_text else None  # Allow empty price
-            
-            drug_type = int(self.drug_type_input.text()) if self.drug_type_input.text().strip() else 0
-            
+            price = int(price_text) if price_text else None
+
+            drug_type = self.drug_type_combo.currentData()
             add_to_listed = self.add_to_listed_checkbox.isChecked()
             add_to_favourited = self.add_to_favourited_checkbox.isChecked()
             use_id_as_name = not self.name_generation_checkbox.isChecked()
 
-            min_props = int(self.min_properties_input.text())
-            max_props = int(self.max_properties_input.text())
-            
-            if min_props > max_props:
-                raise ValueError("Minimum properties cannot exceed maximum")
-            if max_props > 34:
-                raise ValueError("Maximum cannot exceed 34 (total available properties)")
+            # Get selected items from widgets
+            selected_properties = self.properties_widget.get_selected_items()
+            selected_ingredients = self.ingredients_widget.get_selected_items()
 
-            # Backup products FIRST
+            if self.unique_combinations_checkbox.isChecked():
+                # Use full pools if no selections are made
+                properties_to_use = selected_properties if selected_properties else self.property_pool
+                ingredients_to_use = selected_ingredients if selected_ingredients else self.ingredients
+                # Set min and max for unique random selection
+                min_props = 1 if properties_to_use else 0
+                max_props = len(properties_to_use) if properties_to_use else 0
+                min_ingredients = 1 if ingredients_to_use else 0
+                max_ingredients = len(ingredients_to_use) if ingredients_to_use else 0
+            else:
+                # Use only selected items, or empty lists if none selected
+                properties_to_use = selected_properties
+                ingredients_to_use = selected_ingredients
+                min_props = len(properties_to_use) if properties_to_use else 0
+                max_props = min_props
+                min_ingredients = len(ingredients_to_use) if ingredients_to_use else 0
+                max_ingredients = min_ingredients
+
             products_path = self.main_window.manager.current_save / "Products"
             self.main_window.manager.create_feature_backup("Products", [products_path])
             self.main_window.backups_tab.refresh_backup_list()
 
-            # SINGLE call to generate_products
             self.main_window.manager.generate_products(
-                count, id_length, price, 
-                add_to_listed, add_to_favourited,
-                min_props, max_props, drug_type, use_id_as_name
+                count=count,
+                id_length=id_length,
+                price=price,
+                add_to_listed=add_to_listed,
+                add_to_favourited=add_to_favourited,
+                selected_properties=properties_to_use,
+                selected_ingredients=ingredients_to_use,
+                min_props=min_props,
+                max_props=max_props,
+                min_ingredients=min_ingredients,
+                max_ingredients=max_ingredients,
+                drug_type=drug_type,
+                use_id_as_name=use_id_as_name
             )
 
             QMessageBox.information(self, "Success", f"Generated {count} products successfully!")
@@ -1750,27 +1899,27 @@ class UnlocksTab(QWidget):
         self.main_window = main_window
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(15)
+        layout.setSpacing(5)
 
         # Unlock Actions Group
         unlock_group = QGroupBox("Unlock Actions")
         unlock_layout = QVBoxLayout()
         unlock_layout.setContentsMargins(10, 10, 10, 10)
-        unlock_layout.setSpacing(10)
+        unlock_layout.setSpacing(5)
 
         # Items and Weeds Section
         items_weeds_btn = QPushButton("Unlock All Items and Weeds")
         items_weeds_btn.clicked.connect(self.unlock_items_weeds)
         unlock_layout.addWidget(QLabel("Sets Rank & tier To 999 To Unlock All Items/Weeds:"))
         unlock_layout.addWidget(items_weeds_btn)
-        unlock_layout.addSpacing(10)
+        unlock_layout.addSpacing(5)
 
         # Properties Section
         props_btn = QPushButton("Unlock All Properties")
         props_btn.clicked.connect(self.unlock_properties)
         unlock_layout.addWidget(QLabel("Downloads & Enables All Property Types:"))
         unlock_layout.addWidget(props_btn)
-        unlock_layout.addSpacing(10)
+        unlock_layout.addSpacing(5)
 
         # Businesses Section
         business_btn = QPushButton("Unlock All Businesses")
@@ -1783,7 +1932,7 @@ class UnlocksTab(QWidget):
         npc_relation_btn.clicked.connect(self.update_npc_relationships)
         unlock_layout.addWidget(QLabel("Downloads & Updates All NPCs:"))
         unlock_layout.addWidget(npc_relation_btn)
-        unlock_layout.addSpacing(10)
+        unlock_layout.addSpacing(5)
 
         unlock_group.setLayout(unlock_layout)
         layout.addWidget(unlock_group)
@@ -2154,7 +2303,7 @@ class InventoryTab(QWidget):
             npc_json_path = self.main_window.manager.current_save / "NPCs" / self.current_entity / "NPC.json"
             self.main_window.manager.create_feature_backup("NPCs", [inventory_path.parent])
             # Save inventory
-            inventory_data = {"DataType": "InventoryData", "DataVersion": 0, "GameVersion": "0.3.3f14", "Items": items}
+            inventory_data = {"DataType": "InventoryData", "DataVersion": 0, "GameVersion": "0.3.3f15", "Items": items}
             with open(inventory_path, 'w', encoding='utf-8') as f:
                 json.dump(inventory_data, f, indent=4)
             # Save cash
@@ -2173,7 +2322,7 @@ class InventoryTab(QWidget):
         elif self.current_type == "Vehicles":
             contents_path = self.main_window.manager.current_save / "OwnedVehicles" / self.current_entity / "Contents.json"
             self.main_window.manager.create_feature_backup("Vehicles", [contents_path.parent])
-            data = {"DataType": "InventoryData", "DataVersion": 0, "GameVersion": "0.3.3f14", "Items": items}
+            data = {"DataType": "InventoryData", "DataVersion": 0, "GameVersion": "0.3.3f15", "Items": items}
             with open(contents_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
         QMessageBox.information(self, "Success", f"Inventory for {self.current_entity} saved successfully!")
@@ -2185,7 +2334,7 @@ class MiscTab(QWidget):
         self.main_window = main_window
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(15)
+        layout.setSpacing(5)
 
         # Organisation Settings Group
         org_group = QGroupBox("Organization Settings")
@@ -2193,27 +2342,26 @@ class MiscTab(QWidget):
         org_layout.setContentsMargins(10, 10, 10, 10)
         self.organisation_name_input = QLineEdit()
         org_layout.addRow(QLabel("Organization Name:"), self.organisation_name_input)
-        
-        # Add Console Enabled Checkbox
         self.console_enabled_cb = QCheckBox("Console Enabled")
         org_layout.addRow(self.console_enabled_cb)
         org_group.setLayout(org_layout)
         layout.addWidget(org_group)
 
-        # Save Management Group
-        save_mgmt_group = QGroupBox("Save Management")
-        save_mgmt_layout = QFormLayout()
-        save_mgmt_layout.setContentsMargins(10, 10, 10, 10)
-        self.save_folder_combo = QComboBox()
-        self.load_save_folders()  # Populate the combo box
-        save_mgmt_layout.addRow("Select Save Folder:", self.save_folder_combo)
-        self.delete_save_btn = QPushButton("Delete Selected Save Folder")
-        self.delete_save_btn.clicked.connect(self.delete_selected_save)
-        save_mgmt_layout.addRow(self.delete_save_btn)
-        save_mgmt_group.setLayout(save_mgmt_layout)
-        layout.addWidget(save_mgmt_group)
-
-        # Quests Section (existing)
+        # Appearance Selection Group
+        appearance_group = QGroupBox("Appearance Selection")
+        appearance_layout = QVBoxLayout()
+        appearance_layout.setContentsMargins(10, 10, 10, 10)
+        self.appearance_combo = QComboBox()
+        self.appearance_combo.addItems(["None", "Benji", "Uncle Nelson", "Walter White"])
+        appearance_layout.addWidget(QLabel("Select Character Appearance:"))
+        appearance_layout.addWidget(self.appearance_combo)
+        self.apply_appearance_btn = QPushButton("Apply Appearance")
+        self.apply_appearance_btn.clicked.connect(self.apply_appearance)
+        appearance_layout.addWidget(self.apply_appearance_btn)
+        appearance_group.setLayout(appearance_layout)
+        layout.addWidget(appearance_group)
+        
+        # Quests Section
         quests_group = QGroupBox("Quest Management")
         quests_layout = QVBoxLayout()
         quests_layout.setContentsMargins(10, 10, 10, 10)
@@ -2224,7 +2372,7 @@ class MiscTab(QWidget):
         quests_group.setLayout(quests_layout)
         layout.addWidget(quests_group)
 
-        # Variables Section (existing)
+        # Variables Section
         vars_group = QGroupBox("Variable Management")
         vars_layout = QVBoxLayout()
         vars_layout.setContentsMargins(10, 10, 10, 10)
@@ -2236,7 +2384,7 @@ class MiscTab(QWidget):
         vars_group.setLayout(vars_layout)
         layout.addWidget(vars_group)
 
-        # Mod Installation Section (existing)
+        # Mod Installation Section
         mod_group = QGroupBox("Achievement Unlocker")
         mod_layout = QVBoxLayout()
         mod_layout.setContentsMargins(10, 10, 10, 10)
@@ -2247,7 +2395,328 @@ class MiscTab(QWidget):
         mod_group.setLayout(mod_layout)
         layout.addWidget(mod_group)
 
-        # New Save Generation Section (existing)
+        layout.addStretch()
+        self.setLayout(layout)
+        self.vars_warning_label.setText("WARNING: Modifies variables in:\n- Variables/\n- Players/Player_*/Variables/")
+
+        # Define appearance data for each character
+        self.appearance_data = {
+            "Benji": {
+                "Gender": 0,
+                "Weight": 0.4000000059604645,
+                "SkinColor": {"r": 0.615686297416687, "g": 0.49803921580314639, "b": 0.3921568691730499, "a": 1.0},
+                "HairStyle": "Avatar/Hair/Afro/Afro",
+                "HairColor": {"r": 0.3960784375667572, "g": 0.2823529541492462, "b": 0.20000000298023225, "a": 1.0},
+                "Mouth": "Avatar/Layers/Face/Face_Neutral",
+                "FacialHair": "Avatar/Layers/Face/FacialHair_Goatee",
+                "FacialDetails": "",
+                "FacialDetailsIntensity": 0.5,
+                "EyeballColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "UpperEyeLidRestingPosition": 0.3677419424057007,
+                "LowerEyeLidRestingPosition": 0.1548387110233307,
+                "PupilDilation": 0.6338709592819214,
+                "EyebrowScale": 1.2467741966247559,
+                "EyebrowThickness": 1.341935396194458,
+                "EyebrowRestingHeight": -0.06451612710952759,
+                "EyebrowRestingAngle": 0.7096776962280273,
+                "Top": "Avatar/Layers/Top/T-Shirt",
+                "TopColor": {"r": 0.1764705926179886, "g": 0.21568627655506135, "b": 0.40392157435417178, "a": 1.0},
+                "Bottom": "Avatar/Layers/Bottom/Jeans",
+                "BottomColor": {"r": 0.15094339847564698, "g": 0.15094339847564698, "b": 0.15094339847564698, "a": 1.0},
+                "Shoes": "Avatar/Accessories/Feet/Sandals/Sandals",
+                "ShoesColor": {"r": 0.48235294222831728, "g": 0.3294117748737335, "b": 0.2235294133424759, "a": 1.0},
+                "Headwear": "",
+                "HeadwearColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "Eyewear": "",
+                "EyewearColor": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                "Tattoos": []
+            },
+            "Uncle Nelson": {
+                "Gender": 0,
+                "Weight": 0.57419353723526,
+                "SkinColor": {"r": 0.7843137383460999, "g": 0.6549019813537598, "b": 0.545098066329956, "a": 1.0},
+                "HairStyle": "Avatar/Hair/MessyBob/MessyBob",
+                "HairColor": {"r": 0.3207547068595886, "g": 0.3207547068595886, "b": 0.3207547068595886, "a": 1.0},
+                "Mouth": "Avatar/Layers/Face/Face_SmugPout",
+                "FacialHair": "Avatar/Layers/Face/FacialHair_Goatee",
+                "FacialDetails": "Avatar/Layers/Face/OldPersonWrinkles",
+                "FacialDetailsIntensity": 0.8999999761581421,
+                "EyeballColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "UpperEyeLidRestingPosition": 0.2709677517414093,
+                "LowerEyeLidRestingPosition": 0.2806451618671417,
+                "PupilDilation": 0.6177419424057007,
+                "EyebrowScale": 1.0329033136367798,
+                "EyebrowThickness": 1.9483870267868043,
+                "EyebrowRestingHeight": 0.3999999761581421,
+                "EyebrowRestingAngle": 8.322580337524414,
+                "Top": "Avatar/Layers/Top/T-Shirt",
+                "TopColor": {"r": 0.23584908246994019, "g": 0.23584908246994019, "b": 0.23584908246994019, "a": 1.0},
+                "Bottom": "Avatar/Layers/Bottom/Jeans",
+                "BottomColor": {"r": 0.23584908246994019, "g": 0.23584908246994019, "b": 0.23584908246994019, "a": 1.0},
+                "Shoes": "Avatar/Accessories/Feet/Sandals/Sandals",
+                "ShoesColor": {"r": 0.15094339847564698, "g": 0.15094339847564698, "b": 0.15094339847564698, "a": 1.0},
+                "Headwear": "",
+                "HeadwearColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "Eyewear": "",
+                "EyewearColor": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                "Tattoos": []
+            },
+            "Walter White": {
+                "Gender": 0,
+                "Weight": 0.2612903118133545,
+                "SkinColor": {"r": 0.7843137383460999, "g": 0.6549019813537598, "b": 0.545098066329956, "a": 1.0},
+                "HairStyle": "",
+                "HairColor": {"r": 0.7169811725616455, "g": 0.5277085900306702, "b": 0.22659309208393098, "a": 1.0},
+                "Mouth": "Avatar/Layers/Face/Face_Neutral",
+                "FacialHair": "Avatar/Layers/Face/FacialHair_Goatee",
+                "FacialDetails": "Avatar/Layers/Face/OldPersonWrinkles",
+                "FacialDetailsIntensity": 0.7935484051704407,
+                "EyeballColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "UpperEyeLidRestingPosition": 0.35483869910240176,
+                "LowerEyeLidRestingPosition": 0.44516128301620486,
+                "PupilDilation": 0.47580644488334658,
+                "EyebrowScale": 1.0254839658737183,
+                "EyebrowThickness": 1.0,
+                "EyebrowRestingHeight": 0.0,
+                "EyebrowRestingAngle": 0.0,
+                "Top": "Avatar/Layers/Top/T-Shirt",
+                "TopColor": {"r": 0.1764705926179886, "g": 0.21568627655506135, "b": 0.40392157435417178, "a": 1.0},
+                "Bottom": "Avatar/Layers/Bottom/Jeans",
+                "BottomColor": {"r": 0.23529411852359773, "g": 0.23529411852359773, "b": 0.23529411852359773, "a": 1.0},
+                "Shoes": "Avatar/Accessories/Feet/Sneakers/Sneakers",
+                "ShoesColor": {"r": 0.48235294222831728, "g": 0.3294117748737335, "b": 0.2235294133424759, "a": 1.0},
+                "Headwear": "",
+                "HeadwearColor": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "Eyewear": "",
+                "EyewearColor": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
+                "Tattoos": []
+            }
+        }
+
+        self.clothing_data = {
+            "Walter White": {
+                "Items": [
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"dressshoes\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"jeans\",\"Quantity\":1,\"Color\":2}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"belt\",\"Quantity\":1,\"Color\":10}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"flannelshirt\",\"Quantity\":1,\"Color\":2}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"collarjacket\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"rectangleframeglasses\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"porkpiehat\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f12\",\"ID\":\"\",\"Quantity\":0}"
+                ]
+            },
+            "Benji": {
+                "Items": [
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"sandals\",\"Quantity\":1,\"Color\":10}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"jeans\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"flannelshirt\",\"Quantity\":1,\"Color\":7}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}"
+                ]
+            },
+            "Uncle Nelson": {
+                "Items": [
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"sandals\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"jeans\",\"Quantity\":1,\"Color\":3}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"flannelshirt\",\"Quantity\":1,\"Color\":4}",
+                    "{\"DataType\":\"ClothingData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"collarjacket\",\"Quantity\":1,\"Color\":3}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}",
+                    "{\"DataType\":\"ItemData\",\"DataVersion\":0,\"GameVersion\":\"0.3.3f14\",\"ID\":\"\",\"Quantity\":0}"
+                ]
+            }
+        }
+
+    def set_data(self, info):
+        self.organisation_name_input.setText(info.get("organisation_name", ""))
+        game_data = self.main_window.manager._load_json_file("Game.json")
+        console_enabled = game_data.get("Settings", {}).get("ConsoleEnabled", False)
+        self.console_enabled_cb.setChecked(console_enabled)
+
+    def get_data(self):
+        return {
+            "organisation_name": self.organisation_name_input.text(),
+            "console_enabled": self.console_enabled_cb.isChecked()
+        }
+
+    def apply_appearance(self):
+        """Apply the selected appearance and clothing to Appearance.json and Clothing.json."""
+        if not self.main_window or not self.main_window.manager.current_save:
+            QMessageBox.critical(self, "Error", "No save file loaded")
+            return
+
+        selected = self.appearance_combo.currentText()
+        if selected == "None":
+            QMessageBox.information(self, "Info", "No appearance selected. No changes made.")
+            return
+
+        try:
+            player_dir = self.main_window.manager.current_save / "Players/Player_0"
+            appearance_path = player_dir / "Appearance.json"
+            clothing_path = player_dir / "Clothing.json"
+
+            # Create backup of player directory
+            self.main_window.manager.create_feature_backup("Appearance & Clothing", [player_dir])
+            self.main_window.backups_tab.refresh_backup_list()
+
+            # Handle Appearance.json
+            if appearance_path.exists():
+                appearance_path.unlink()
+            with open(appearance_path, 'w', encoding='utf-8') as f:
+                json.dump(self.appearance_data[selected], f, indent=4)
+
+            # Handle Clothing.json
+            if clothing_path.exists():
+                clothing_path.unlink()
+            with open(clothing_path, 'w', encoding='utf-8') as f:
+                json.dump(self.clothing_data[selected], f, indent=4)
+
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"Applied {selected}'s appearance and clothing successfully!"
+            )
+        except KeyError:
+            QMessageBox.critical(self, "Error", f"No data found for {selected}")
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Error", 
+                f"Failed to apply appearance and clothing: {str(e)}"
+            )
+
+    def complete_all_quests(self):
+        if not self.main_window or not self.main_window.manager.current_save:
+            QMessageBox.critical(self, "Error", "No save file loaded")
+            return
+        try:
+            quests_path = self.main_window.manager.current_save / "Quests"
+            self.main_window.manager.create_feature_backup("Quests", [quests_path])
+            quests_completed, objectives_completed = self.main_window.manager.complete_all_quests()
+            self.main_window.backups_tab.refresh_backup_list()
+            QMessageBox.information(self, "Quests Completed",
+                                    f"Marked {quests_completed} quests and {objectives_completed} objectives as completed!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to complete quests: {str(e)}")
+
+    def modify_variables(self):
+        if not hasattr(self, 'main_window') or not self.main_window.manager.current_save:
+            QMessageBox.critical(self, "Error", "No save file loaded")
+            return
+        try:
+            variables_paths = [self.main_window.manager.current_save / "Variables"]
+            for i in range(10):
+                player_vars = self.main_window.manager.current_save / f"Players/Player_{i}/Variables"
+                if player_vars.exists():
+                    variables_paths.append(player_vars)
+            self.main_window.manager.create_feature_backup("Variables", variables_paths)
+            count = self.main_window.manager.modify_variables()
+            self.main_window.backups_tab.refresh_backup_list()
+            QMessageBox.information(self, "Variables Modified",
+                                    f"Successfully updated {count} variables!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to modify variables: {str(e)}")
+
+    def update_vars_warning(self):
+        if not self.main_window or not self.main_window.manager.current_save:
+            return
+        players_path = self.main_window.manager.current_save / "Players"
+        player_dirs = [f"Player_{i}" for i in range(10) if (players_path / f"Player_{i}").exists()]
+        lines = ["- Variables/"]
+        if player_dirs:
+            for dir_name in player_dirs:
+                lines.append(f"- Players/{dir_name}/Variables/")
+        else:
+            lines.append("- Players/Player_*/Variables/ (no player directories found)")
+        warning_text = "WARNING: Modifies variables in:\n" + "\n".join(lines)
+        self.vars_warning_label.setText(warning_text)
+
+    def install_mod(self):
+        if not self.main_window or not self.main_window.manager.current_save:
+            QMessageBox.critical(self, "Error", "No save file loaded")
+            return
+        game_dir = find_game_directory()
+        if not game_dir:
+            QMessageBox.critical(self, "Error", "Could not find Schedule I installation directory.")
+            return
+        mods_dir = game_dir / "Mods"
+        if not mods_dir.exists():
+            QMessageBox.warning(
+                self,
+                "MelonLoader Not Installed",
+                "MelonLoader is required to use mods but is not installed.\n"
+                "Please download and install MelonLoader from https://melonwiki.xyz/\n"
+                "and run the game once to create the Mods folder."
+            )
+            return
+        dll_url = "https://github.com/N0edL/Schedule-1-Save-File-Editor/raw/refs/heads/main/NPCs/AchievementUnlocker.dll"
+        dll_path = mods_dir / "AchievementUnlocker.dll"
+        if dll_path.exists():
+            reply = QMessageBox.question(
+                self,
+                "File Exists",
+                "AchievementUnlocker.dll already exists in the Mods folder. Overwrite?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+        try:
+            urllib.request.urlretrieve(dll_url, dll_path)
+            QMessageBox.information(
+                self,
+                "Success",
+                "AchievementUnlocker.dll has been successfully installed to the Mods folder!"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to install mod: {str(e)}")
+
+class TransferTab(QWidget):
+    def __init__(self, parent=None, main_window=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(5)
+
+        # Transfer Old Saves Group
+        transfer_group = QGroupBox("Transfer Old Saves")
+        transfer_layout = QFormLayout()
+        transfer_layout.setContentsMargins(10, 10, 10, 10)
+        self.old_save_combo = QComboBox()
+        self.populate_old_saves()
+        transfer_layout.addRow("Select Save Folder:", self.old_save_combo)
+        transfer_button = QPushButton("Transfer Saves")
+        transfer_button.clicked.connect(self.transfer_saves)
+        transfer_layout.addRow(transfer_button)
+        transfer_group.setLayout(transfer_layout)
+        layout.addWidget(transfer_group)
+
+        # Save Management Group
+        save_mgmt_group = QGroupBox("Delete Saves")
+        save_mgmt_layout = QFormLayout()
+        save_mgmt_layout.setContentsMargins(10, 10, 10, 10)
+        self.save_folder_combo = QComboBox()
+        self.load_save_folders()  # Populate the combo box
+        save_mgmt_layout.addRow("Select Save Folder:", self.save_folder_combo)
+        self.delete_save_btn = QPushButton("Delete Selected Save Folder")
+        self.delete_save_btn.clicked.connect(self.delete_selected_save)
+        save_mgmt_layout.addRow(self.delete_save_btn)
+        save_mgmt_group.setLayout(save_mgmt_layout)
+        layout.addWidget(save_mgmt_group)
+
+        # New Save Generation Group
         new_save_group = QGroupBox("New Save Generation")
         new_save_layout = QFormLayout()
         new_save_layout.setContentsMargins(10, 10, 10, 10)
@@ -2261,152 +2730,125 @@ class MiscTab(QWidget):
 
         layout.addStretch()
         self.setLayout(layout)
-        self.vars_warning_label.setText("WARNING: Modifies variables in:\n- Variables/\n- Players/Player_*/Variables/")
 
-    def set_data(self, info):
-        """Populate the input fields with data from the info dictionary."""
-        self.organisation_name_input.setText(info.get("organisation_name", ""))
-        # Get ConsoleEnabled from Settings
-        game_data = self.main_window.manager._load_json_file("Game.json")
-        console_enabled = game_data.get("Settings", {}).get("ConsoleEnabled", False)
-        self.console_enabled_cb.setChecked(console_enabled)
-
-    def get_data(self):
-        """Retrieve data from the input fields."""
-        return {
-            "organisation_name": self.organisation_name_input.text(),
-            "console_enabled": self.console_enabled_cb.isChecked()
-        }
-        
-    def complete_all_quests(self):
-        if not self.main_window or not self.main_window.manager.current_save:
-            QMessageBox.critical(self, "Error", "No save file loaded")
+    def populate_old_saves(self):
+        """Populate the combo box with available old save slots."""
+        source_dir = Path.home() / "AppData" / "LocalLow" / "TVGS" / "Schedule I Free Sample" / "Saves"
+        if not source_dir.exists():
+            self.old_save_combo.addItem("No old saves found")
             return
-        try:
-            # Backup quests
-            quests_path = self.main_window.manager.current_save / "Quests"
-            self.main_window.manager.create_feature_backup("Quests", [quests_path])
 
-            quests_completed, objectives_completed = self.main_window.manager.complete_all_quests()
-            self.main_window.backups_tab.refresh_backup_list()
-            QMessageBox.information(self, "Quests Completed",
-                                    f"Marked {quests_completed} quests and {objectives_completed} objectives as completed!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to complete quests: {str(e)}")
-
-    def modify_variables(self):
-        if not hasattr(self, 'main_window') or not self.main_window.manager.current_save:
-            QMessageBox.critical(self, "Error", "No save file loaded")
-            return
-        try:
-            # Backup variables
-            variables_paths = [self.main_window.manager.current_save / "Variables"]
-            for i in range(10):
-                player_vars = self.main_window.manager.current_save / f"Players/Player_{i}/Variables"
-                if player_vars.exists():
-                    variables_paths.append(player_vars)
-            self.main_window.manager.create_feature_backup("Variables", variables_paths)
-
-            count = self.main_window.manager.modify_variables()
-            self.main_window.backups_tab.refresh_backup_list()
-            QMessageBox.information(self, "Variables Modified",
-                                    f"Successfully updated {count} variables!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to modify variables: {str(e)}")
-
-    def update_vars_warning(self):
-        """Update the variables warning message with detected player directories."""
-        if not self.main_window or not self.main_window.manager.current_save:
-            return  # No save loaded
-
-        players_path = self.main_window.manager.current_save / "Players"
-        player_dirs = []
-        # Check for Player_0 to Player_9
-        for i in range(10):
-            dir_path = players_path / f"Player_{i}"
-            if dir_path.exists():
-                player_dirs.append(f"Player_{i}")
-
-        # Build the warning message lines
-        lines = ["- Variables/"]
-        if player_dirs:
-            for dir_name in player_dirs:
-                lines.append(f"- Players/{dir_name}/Variables/")
+        save_folders = [f for f in source_dir.iterdir() if f.is_dir() and f.name.startswith("SaveGame_")]
+        if save_folders:
+            for folder in save_folders:
+                self.old_save_combo.addItem(folder.name, str(folder))
         else:
-            lines.append("- Players/Player_*/Variables/ (no player directories found)")
+            # Check for JSON files directly under source_dir
+            json_files = list(source_dir.glob("*.json"))
+            if json_files:
+                self.old_save_combo.addItem("Default Save", str(source_dir))
+            else:
+                self.old_save_combo.addItem("No old saves found")
 
-        warning_text = "WARNING: Modifies variables in:\n" + "\n".join(lines)
-        self.vars_warning_label.setText(warning_text)
+    def transfer_saves(self):
+        """Transfer the selected old save to a new save slot and update JSON versions."""
+        try:
+            if self.old_save_combo.count() == 0 or self.old_save_combo.currentText() == "No old saves found":
+                raise ValueError("No old saves available to transfer.")
 
-    def install_mod(self):
-            """
-            Download AchievementUnlocker.dll and place it in the game's Mods folder.
-            Checks for MelonLoader and prompts the user if it's not installed.
-            """
-            if not self.main_window or not self.main_window.manager.current_save:
-                QMessageBox.critical(self, "Error", "No save file loaded")
-                return
+            selected = self.old_save_combo.currentData()
+            source_path = Path(selected)
 
-            game_dir = find_game_directory()
-            if not game_dir:
-                QMessageBox.critical(self, "Error", "Could not find Schedule I installation directory.")
-                return
+            next_save_name = self.main_window.manager.get_next_save_folder_name()
+            if not next_save_name:
+                raise ValueError("All save slots (1-5) are full. Please delete an existing save first.")
 
-            mods_dir = game_dir / "Mods"
-            if not mods_dir.exists():
-                QMessageBox.warning(
-                    self,
-                    "MelonLoader Not Installed",
-                    "MelonLoader is required to use mods but is not installed.\n"
-                    "Please download and install MelonLoader from https://melonwiki.xyz/\n"
-                    "and run the game once to create the Mods folder."
-                )
-                return
+            dest_save_dir = self.main_window.manager.steamid_folder / next_save_name
+            dest_save_dir.mkdir(exist_ok=True)  # Create the destination directory if it doesn’t exist
 
-            dll_url = "https://github.com/N0edL/Schedule-1-Save-File-Editor/raw/refs/heads/main/NPCs/AchievementUnlocker.dll"
-            dll_path = mods_dir / "AchievementUnlocker.dll"
+            # Copy contents of source_path to dest_save_dir, not the folder itself
+            for item in source_path.iterdir():
+                if item.is_dir():
+                    shutil.copytree(item, dest_save_dir / item.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest_save_dir / item.name)
 
-            if dll_path.exists():
-                reply = QMessageBox.question(
-                    self,
-                    "File Exists",
-                    "AchievementUnlocker.dll already exists in the Mods folder. Overwrite?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-                if reply == QMessageBox.No:
-                    return
+            # Update all JSON files in the new save slot
+            json_files = list(dest_save_dir.rglob("*.json"))
+            for json_file in json_files:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if "GameVersion" in data:
+                    data["GameVersion"] = "0.3.3f15"
+                with open(json_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
 
+            QMessageBox.information(self, "Success", f"Transferred save to new slot '{next_save_name}'.")
+            self.main_window.populate_save_table()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+     
+    def load_save_folders(self):
+            """Populate the save folder combo box with available saves."""
+            saves = self.main_window.manager.get_save_folders()
+            self.save_folder_combo.clear()
+            for save in saves:
+                self.save_folder_combo.addItem(save['name'], save['path'])
+
+    def delete_selected_save(self):
+        save_path = self.save_folder_combo.currentData()
+        if not save_path:
+            QMessageBox.warning(self, "No Selection", "Please select a save folder to delete.")
+            return
+
+        backup_path = Path(save_path).parent / (Path(save_path).name + '_Backup')
+        if Path(save_path) == self.main_window.manager.current_save:
+            warning_msg = ("You are about to delete the currently loaded save folder and its backup.\n"
+                           "This action cannot be undone and will close the editor.\n"
+                           "Are you sure?")
+        else:
+            warning_msg = (f"Are you sure you want to delete the save folder "
+                           f"'{self.save_folder_combo.currentText()}' and its backup?\n"
+                           "This action cannot be undone.")
+
+        reply = QMessageBox.warning(
+            self, "Confirm Delete", warning_msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
             try:
-                urllib.request.urlretrieve(dll_url, dll_path)
-                QMessageBox.information(
-                    self,
-                    "Success",
-                    "AchievementUnlocker.dll has been successfully installed to the Mods folder!"
-                )
+                shutil.rmtree(save_path)
+                if backup_path.exists():
+                    shutil.rmtree(backup_path)
+                QMessageBox.information(self, "Success", "Save folder and its backup deleted successfully.")
+                self.load_save_folders()
+                self.main_window.populate_save_table()
+                if Path(save_path) == self.main_window.manager.current_save:
+                    self.main_window.back_to_selection()
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to install mod: {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to delete save folder or backup: {str(e)}")
 
     def generate_new_save(self):
         new_org_name = self.new_org_name_input.text().strip()
         if not new_org_name:
             QMessageBox.warning(self, "Invalid Input", "Please enter an organization name for the new save.")
             return
-        
+
         try:
             next_save_name = self.main_window.manager.get_next_save_folder_name()
             if not next_save_name:
                 QMessageBox.warning(
-                    self,
-                    "Maximum Saves Reached",
+                    self, "Maximum Saves Reached",
                     "You have reached the maximum of 5 save slots.\n"
                     "Please delete an existing save folder before creating a new one.",
                     QMessageBox.Ok
                 )
                 return
-            
+
             new_save_path = self.main_window.manager.steamid_folder / next_save_name
-            
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 zip_path = Path(temp_dir) / "SaveGame_1.zip"
                 urllib.request.urlretrieve(
@@ -2422,7 +2864,7 @@ class MiscTab(QWidget):
                         target_path.parent.mkdir(parents=True, exist_ok=True)
                         with zip_ref.open(member) as source, open(target_path, 'wb') as target:
                             target.write(source.read())
-            
+
             game_json_path = new_save_path / "Game.json"
             if game_json_path.exists():
                 with open(game_json_path, 'r', encoding='utf-8') as f:
@@ -2432,84 +2874,23 @@ class MiscTab(QWidget):
                     json.dump(data, f, indent=4)
             else:
                 raise FileNotFoundError("Game.json not found in the new save folder")
-            
+
             QMessageBox.information(
-                self,
-                "Success",
+                self, "Success",
                 f"New save folder '{next_save_name}' created with organization name '{new_org_name}'.\n"
                 "Return to the save selection page to load it."
             )
-            # Refresh the save selection list
             self.main_window.populate_save_table()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to generate new save folder: {str(e)}")
-
-    def load_save_folders(self):
-            """Populate the save folder combo box with available saves."""
-            saves = self.main_window.manager.get_save_folders()
-            self.save_folder_combo.clear()
-            for save in saves:
-                self.save_folder_combo.addItem(save['name'], save['path'])
-
-    def delete_selected_save(self):
-        # Get the selected save folder path from the combo box
-        save_path = self.save_folder_combo.currentData()
-        if not save_path:
-            QMessageBox.warning(self, "No Selection", "Please select a save folder to delete.")
-            return
-
-        # Construct the backup folder path (assumes backup is save folder name + '_Backup')
-        backup_path = Path(save_path).parent / (Path(save_path).name + '_Backup')
-
-        # Prepare a warning message, customized if it's the current save
-        if Path(save_path) == self.main_window.manager.current_save:
-            warning_msg = ("You are about to delete the currently loaded save folder and its backup.\n"
-                        "This action cannot be undone and will close the editor.\n"
-                        "Are you sure?")
-        else:
-            warning_msg = (f"Are you sure you want to delete the save folder "
-                        f"'{self.save_folder_combo.currentText()}' and its backup?\n"
-                        "This action cannot be undone.")
-
-        # Show confirmation dialog
-        reply = QMessageBox.warning(
-            self,
-            "Confirm Delete",
-            warning_msg,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-
-        # Proceed with deletion if user confirms
-        if reply == QMessageBox.Yes:
-            try:
-                # Delete the main save folder
-                shutil.rmtree(save_path)
-
-                # Delete the backup folder if it exists
-                if backup_path.exists():
-                    shutil.rmtree(backup_path)
-
-                # Notify user of success
-                QMessageBox.information(self, "Success", "Save folder and its backup deleted successfully.")
-                
-                # Refresh UI elements
-                self.load_save_folders()  # Update the combo box
-                self.main_window.populate_save_table()  # Update the save selection table
-                
-                # If the deleted save was the current one, return to selection screen
-                if Path(save_path) == self.main_window.manager.current_save:
-                    self.main_window.back_to_selection()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete save folder or backup: {str(e)}")
-
+            QMessageBox.critical(self, "Error", f"Failed to generate new save folder: {str(e)}") 
+           
 class BackupsTab(QWidget):
     def __init__(self, parent=None, main_window=None):
         super().__init__(parent)
         self.main_window = main_window
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(15)
+        layout.setSpacing(5)
 
         # Revert Changes Section
         revert_group = QGroupBox("Revert Changes")
@@ -2766,13 +3147,13 @@ class CreditsTab(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(15)
+        layout.setSpacing(5)
 
         # Credits Group
         credits_group = QGroupBox("Credits")
         credits_layout = QVBoxLayout()
         credits_layout.setContentsMargins(15, 15, 15, 15)
-        credits_layout.setSpacing(12)
+        credits_layout.setSpacing(5)
 
         # Title
         title = QLabel("Schedule I Save Editor")
@@ -2813,7 +3194,7 @@ class CreditsTab(QWidget):
         # Repository Info
         repo_layout = QHBoxLayout()
         repo_layout.setContentsMargins(0, 10, 0, 0)
-        repo_layout.setSpacing(10)  # Space between buttons
+        repo_layout.setSpacing(5)  # Space between buttons
         
         # Create buttons with consistent width
         buttons = [
@@ -2844,7 +3225,7 @@ class SaveEditorWindow(QMainWindow):
         self.setWindowTitle("Schedule I Save Editor")
         self.setGeometry(100, 100, 800, 600)
         self.center_window()
-
+        
         def icon_path(relative_path):
             """ Get absolute path to resource, works for dev and for PyInstaller """
             try:
@@ -2857,7 +3238,7 @@ class SaveEditorWindow(QMainWindow):
         self.setWindowIcon(QIcon(icon_path("icon.ico")))
         self.check_for_updates() 
         self.check_first_run()
-        
+
     def center_window(self):
         """Center the window on the screen."""
         frame_geo = self.frameGeometry()
@@ -2894,69 +3275,23 @@ class SaveEditorWindow(QMainWindow):
         self.update_thread.start()
 
     def handle_update_result(self, result):
-        latest_version, download_url = result
-        if not latest_version or not download_url:
-            return
+            latest_version, download_url = result
+            if not latest_version or not download_url:
+                return
 
-        latest_clean = latest_version.lstrip('v')
-        current_clean = CURRENT_VERSION.lstrip('v')
+            latest_clean = latest_version.lstrip('v')
+            current_clean = CURRENT_VERSION.lstrip('v')
 
-        if self.compare_versions(latest_clean, current_clean) > 0:
-            reply = QMessageBox.question(
-                self,
-                "Update Available",
-                f"New version {latest_version} is available (Current: v{CURRENT_VERSION}).\nWould you like to update now?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                self.download_and_apply_update(download_url)
-
-    def download_and_apply_update(self, download_url):
-        if not getattr(sys, 'frozen', False):
-            QMessageBox.information(self, "Info", "Auto-update is only supported in the packaged executable.")
-            return
-
-        try:
-            # Download the new executable
-            downloads_dir = Path.home() / "Downloads"
-            downloaded_exe = downloads_dir / os.path.basename(download_url)
-            
-            # Show download progress
-            progress = QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
-            progress.setWindowTitle("Updating")
-            progress.setWindowModality(Qt.WindowModal)
-            
-            def update_progress(count, block_size, total_size):
-                percent = (count * block_size * 100) // total_size
-                progress.setValue(percent)
-                if progress.wasCanceled():
-                    raise Exception("Download canceled")
-            
-            urllib.request.urlretrieve(download_url, downloaded_exe, update_progress)
-            progress.close()
-
-            # Create batch script
-            current_exe = sys.executable
-            current_dir = os.path.dirname(current_exe)
-            bat_content = f"""@echo off
-timeout /t 1 /nobreak >nul
-taskkill /IM "{os.path.basename(current_exe)}" /F >nul 2>&1
-del /F /Q "{current_exe}" >nul 2>&1
-copy /Y "{downloaded_exe}" "{current_exe}" >nul 2>&1
-start "" "{current_exe}"
-del "%~f0"
-"""
-            # Write batch file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.bat', delete=False, encoding='utf-8') as bat_file:
-                bat_file.write(bat_content)
-                bat_path = bat_file.name
-
-            subprocess.Popen(['cmd.exe', '/C', bat_path], shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            sys.exit()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Update Error", f"Failed to apply update: {str(e)}")
+            if self.compare_versions(latest_clean, current_clean) > 0:
+                reply = QMessageBox.question(
+                    self,
+                    "Update Available",
+                    f"New version {latest_version} is available (Current: {CURRENT_VERSION}).\nWould you like to update now?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.download_and_apply_update(download_url)
 
     def compare_versions(self, v1, v2):
         def parse_version(v):
@@ -2965,6 +3300,7 @@ del "%~f0"
                 if part.isdigit():
                     parts.append(int(part))
                 else:
+                    # Handle non-numeric parts by ignoring them
                     break
             return parts
         
@@ -3132,10 +3468,8 @@ del "%~f0"
         self.networth_label.setText(f"${info.get('networth', 0):,}")
         self.lifetime_earnings_label.setText(f"${info.get('lifetime_earnings', 0):,}")
         self.weekly_deposit_sum_label.setText(f"${info.get('weekly_deposit_sum', 0):,}")
-        self.rank_label.setText(f"{RANK_NAMES[info.get('rank_number', 0)] if info.get('rank_number', 0) < len(RANK_NAMES) else "Unknown"} (Rank: {info.get('rank_number', 0)}, Tier: {info.get('tier', 0)})")
+        self.rank_label.setText(f"{info.get('current_rank', 'Unknown')} (Rank: {info.get('rank_number', 0)}, Tier: {info.get('tier', 0)})")
         self.playtime_label.setText(info.get('playtime', '0d, 0h, 0m, 0s'))
-
-        
 
     def create_edit_save_page(self):
         page = QWidget()
@@ -3149,6 +3483,7 @@ del "%~f0"
         self.unlocks_tab = UnlocksTab(main_window=self)
         self.inventory_tab = InventoryTab(main_window=self)
         self.misc_tab = MiscTab(main_window=self)
+        self.transfer_tab = TransferTab(main_window=self)
         self.backups_tab = BackupsTab(main_window=self)
         self.theme_tab = ThemeTab()
         self.credits_tab = CreditsTab()
@@ -3160,6 +3495,7 @@ del "%~f0"
         tab_widget.addTab(self.unlocks_tab, "Unlocks")
         tab_widget.addTab(self.inventory_tab, "Inventory")
         tab_widget.addTab(self.misc_tab, "Misc")
+        tab_widget.addTab(self.transfer_tab, "Saves")
         tab_widget.addTab(self.backups_tab, "Backups")
         tab_widget.addTab(self.theme_tab, "Themes")
         tab_widget.addTab(self.credits_tab, "Credits")
@@ -3200,7 +3536,6 @@ del "%~f0"
             self.properties_tab.load_plastic_pots()
             self.backups_tab.refresh_backup_list()
             self.inventory_tab.refresh_data()
-            self.misc_tab.load_save_folders()
 
     def apply_changes(self):
             try:
@@ -3226,9 +3561,9 @@ del "%~f0"
                 self.manager.set_cash_balance(money_data["cash_balance"])
 
                 # Apply rank changes
+                self.manager.set_rank(rank_data["current_rank"])
                 self.manager.set_rank_number(rank_data["rank_number"])
                 self.manager.set_tier(rank_data["tier"])
-                self.manager.set_total_xp(rank_data["total_xp"])
 
                 self.manager.set_organisation_name(misc_data["organisation_name"])
                 
@@ -3251,8 +3586,15 @@ del "%~f0"
         self.stacked_widget.setCurrentWidget(self.save_selection_page)
 
 if __name__ == "__main__":
+    # Check if running with admin privileges
+    if not is_admin():
+        print("Not running as administrator. Attempting to relaunch with elevated privileges...")
+        run_as_admin()
+    else:
+        print("Running with administrator privileges.")
+
+    # Proceed with the application initialization
     app = QApplication(sys.argv)
-    widget = QWidget()
     window = SaveEditorWindow()
     window.show()
     sys.exit(app.exec())
